@@ -19,6 +19,7 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 
+from glob import glob
 import ConfigParser
 import os
 from ansible.module_utils.pycompat24 import get_exception
@@ -28,7 +29,7 @@ DOCUMENTATION = '''
 ---
 module: yum_repository
 author: Jiri Tyr (@jtyr)
-version_added: '2.1'
+version_added: '2.2'
 short_description: Add and remove YUM repositories
 description:
   - Add or remove YUM repositories in RPM-based Linux distributions.
@@ -151,6 +152,13 @@ options:
       - C(packages) means that only RPM package downloads should be cached (but
          not repository metadata downloads).
       - C(none) means that no HTTP downloads should be cached.
+  ignore_repo_files:
+    version_added: '2.2'
+    required: false
+    default: None
+    description:
+      - List of repo files which should be ignored during deletion in the
+        Managed Mode. Default is empty list (C([])).
   include:
     required: false
     default: null
@@ -240,7 +248,7 @@ options:
         expire.
       - Default value is 6 hours.
   name:
-    required: true
+    required: false
     description:
       - Unique repository ID.
       - This parameter is only required if I(state) is set to C(present) or
@@ -355,10 +363,19 @@ options:
       - Defines whether yum should verify SSL certificates/hosts at all.
   state:
     required: false
-    choices: [absent, present]
+    choices: [absent, present, mm_enabled, mm_disabled, managed]
     default: present
     description:
-      - State of the repo file.
+      - The state of the repo file (C(absent), C(present)) or the Managed Mode
+        (C(mm_enabled), C(mm_disabled), C(managed)).
+      - The C(mm_enabled) will enable Managed Mode. This state should be used
+        somewhere at the beginning of the playbook before any M(yum_repository)
+        module calls are made.
+      - The C(mm_disabled) will disable the Managed Mode.
+      - The C(managed) will initiate the deletion of unmanaged repo files if
+        the I(mm_enabled) was used before. This state should be used only
+        somewhere at the end of the playbook where M(yum_repository) module is
+        called no more.
   throttle:
     required: false
     default: null
@@ -447,6 +464,37 @@ EXAMPLES = '''
     gpgkey: http://server.com/keys/somerepo.pub
     gpgcheck: yes
     params: "{{ my_role_somerepo_params }}"
+
+#
+# Example of a playbook using the Managed Mode
+#
+
+- name: Initial play
+  hosts: all
+  tasks:
+    - name: Enable the Managed Mode
+      yum_repository:
+        state: mm_enabled
+
+- name: My play
+  hosts: testhost1
+  tasks:
+    - name: Create a repo file
+      yum_repository:
+        name: myrepo
+        description: Managed repo
+        baseurl: http://repo.server.com/path/to/the/repo
+
+- name: Final play
+  hosts: all
+  tasks:
+    - name: Delete unmanaged repo files
+      yum_repository:
+        state: managed
+        # These repo files won't be deleted even if they are not managed
+        ignore_repo_files:
+          - CentOS-Base
+          - CentOS-Media
 '''
 
 RETURN = '''
@@ -623,6 +671,201 @@ class YumRepo(object):
         return repo_string
 
 
+class ManagedMode(object):
+    def __init__(self, module):
+        # To be able to use fail_json
+        self.module = module
+        # Shortcut for the params
+        self.params = self.module.params
+        # Path to the .managed file
+        self.file = "%s/.managed" % self.params['reposdir']
+
+    def enable(self):
+        changed = False
+
+        file_exists = os.path.isfile(self.file)
+
+        if (
+                not file_exists or
+                os.path.getsize(self.file) > 0):
+            if not self.module.check_mode:
+                # Create an empty file or truncate the existing one
+                try:
+                    open(self.file, 'w').close()
+                except IOError:
+                    e = get_exception()
+                    self.module.fail_json(
+                        msg="Cannot create managed file '%s'." % self.file,
+                        details=str(e))
+
+            # Register the change if the file was just created
+            if not file_exists:
+                changed = True
+
+        return changed
+
+    def disable(self):
+        changed = False
+
+        # Delete the file if exists
+        if os.path.isfile(self.file):
+            if not self.module.check_mode:
+                try:
+                    os.remove(self.file)
+                except OSError:
+                    e = get_exception()
+                    self.module.fail_json(
+                        msg="Cannot delete managed file '%s'." % self.file,
+                        details=str(e))
+
+            # Register the change
+            changed = True
+
+        return changed
+
+    def add(self, repo_file):
+        changed = False
+
+        if os.path.isfile(self.file):
+            try:
+                fd = open(self.file, 'a+')
+            except IOError:
+                e = get_exception()
+                self.module.fail_json(
+                    msg="Cannot open managegment file '%s'." % self.file,
+                    details=str(e))
+
+            found = False
+
+            # Check if the repo file is already managed
+            for line in fd.read().splitlines():
+                if line == repo_file:
+                    found = True
+                    break
+
+            if not found:
+                if not self.module.check_mode:
+                    # Add the repo file name into the managed file
+                    fd.write("%s\n" % repo_file)
+
+                # Register the change
+                changed = True
+
+            try:
+                fd.close()
+            except IOError:
+                e = get_exception()
+                self.module.fail_json(
+                    msg=(
+                        "Cannot close the managed file '%s'." % self.file),
+                    details=str(e))
+
+        return changed
+
+    def remove(self, repo_file):
+        changed = False
+
+        if os.path.isfile(self.file):
+            try:
+                fd = open(self.file, 'r')
+            except IOError:
+                e = get_exception()
+                self.module.fail_json(
+                    msg="Cannot open the managed file '%s'." % self.file,
+                    details=str(e))
+
+            found = -1
+
+            lines = fd.read().splitlines()
+
+            # Check if the repo file is managed
+            for i, line in enumerate(lines):
+                if line == repo_file:
+                    found = i
+                    break
+
+            if found > -1:
+                lines.pop(found)
+                # Register the change
+                changed = True
+
+            # Close the file
+            try:
+                fd.close()
+            except IOError:
+                e = get_exception()
+                self.module.fail_json(
+                    msg="Cannot close the managed file '%s'." % self.file,
+                    details=str(e))
+
+            # Build the file from scratch
+            if not self.module.check_mode:
+                # Clear the file
+                self.enable()
+
+                # Add remaining lines back into the file
+                for line in lines:
+                    # Record the change
+                    self.add(line)
+
+        return changed
+
+    def process(self):
+        changed = False
+
+        if os.path.isfile(self.file):
+            # Get list of repo files
+            repo_files = glob("%s/*.repo" % self.params['reposdir'])
+
+            try:
+                fd = open(self.file, 'r')
+            except IOError:
+                e = get_exception()
+                self.module.fail_json(
+                    msg="Cannot open the managed file '%s'." % self.file,
+                    details=str(e))
+
+            # Walk through the managed repos
+            managed_files = fd.read().splitlines()
+
+            # Close the file
+            try:
+                fd.close()
+            except IOError:
+                e = get_exception()
+                self.module.fail_json(
+                    msg="Cannot close the managed file '%s'." % self.file,
+                    details=str(e))
+
+            # Walk through the repo files and check if they are managed
+            for f in repo_files:
+                # Get only the file name without the extension
+                repo_file = os.path.basename(f)[:-5]
+
+                if (
+                        repo_file not in managed_files and
+                        repo_file not in self.params['ignore_repo_files']):
+                    if not self.module.check_mode:
+                        # Delete the file if not managed
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            e = get_exception()
+                            self.module.fail_json(
+                                msg=(
+                                    "Cannot delete the unmanaged repo file "
+                                    "'%s'." % f),
+                                details=str(e))
+
+                        # Delete it from the managed file as well
+                        self.remove(repo_file)
+
+                    # Register the change
+                    changed = True
+
+        return changed
+
+
 def main():
     # Module settings
     module = AnsibleModule(
@@ -658,8 +901,8 @@ def main():
             metalink=dict(),
             mirrorlist=dict(),
             mirrorlist_expire=dict(),
-            name=dict(required=True),
-            params=dict(type='dict'),
+            name=dict(),
+            params=dict(),
             password=dict(no_log=True),
             priority=dict(),
             protect=dict(type='bool'),
@@ -676,7 +919,14 @@ def main():
             sslclientcert=dict(),
             sslclientkey=dict(),
             sslverify=dict(type='bool'),
-            state=dict(choices=['present', 'absent'], default='present'),
+            state=dict(
+                choices=[
+                    'present',
+                    'absent',
+                    'mm_enabled',
+                    'mm_disabled',
+                    'managed'],
+                default='present'),
             throttle=dict(),
             timeout=dict(),
             ui_repoid_vars=dict(),
@@ -696,6 +946,9 @@ def main():
     state = module.params['state']
 
     # Check if required parameters are present
+    if state in ['present', 'absent'] and name is None:
+        module.fail_json(
+            msg="Parameter 'name' is required.")
     if state == 'present':
         if (
                 module.params['baseurl'] is None and
@@ -706,44 +959,67 @@ def main():
             module.fail_json(
                 msg="Parameter 'description' is required.")
 
-    # Rename "name" and "description" to ensure correct key sorting
-    module.params['repoid'] = module.params['name']
-    module.params['name'] = module.params['description']
-    del module.params['description']
+    # Instantiate the ManagedMode object
+    mm = ManagedMode(module)
 
-    # Define repo file name if it doesn't exist
-    if module.params['file'] is None:
-        module.params['file'] = module.params['repoid']
+    if state in ['present', 'absent']:
+        # Rename "name" and "description" to ensure correct key sorting
+        module.params['repoid'] = module.params['name']
+        module.params['name'] = module.params['description']
+        del module.params['description']
+        del module.params['ignore_repo_files']
 
-    # Instantiate the YumRepo object
-    yumrepo = YumRepo(module)
+        # Define repo file name if it doesn't exist
+        if module.params['file'] is None:
+            module.params['file'] = module.params['repoid']
 
-    # Get repo status before change
-    yumrepo_before = yumrepo.dump()
+        # Instantiate the YumRepo object
+        yumrepo = YumRepo(module)
 
-    # Perform action depending on the state
-    if state == 'present':
-        yumrepo.add()
-    elif state == 'absent':
-        yumrepo.remove()
+        # Get repo status before change
+        yumrepo_before = yumrepo.dump()
 
-    # Get repo status after change
-    yumrepo_after = yumrepo.dump()
+        # Perform action depending on the state
+        if state == 'present':
+            yumrepo.add()
 
-    # Compare repo states
-    changed = yumrepo_before != yumrepo_after
+            # Make sure the repo file is managed if required
+            mm.add(module.params['file'])
+        elif state == 'absent':
+            yumrepo.remove()
 
-    # Save the file only if not in check mode and if there was a change
-    if not module.check_mode and changed:
-        yumrepo.save()
+            # If the file was removed, remove also from the managed list
+            if not os.path.isfile(module.params['file']):
+                mm.remove(module.params['file'])
 
-    # Change file attributes if needed
-    if os.path.isfile(module.params['dest']):
-        file_args = module.load_file_common_arguments(module.params)
-        changed = module.set_fs_attributes_if_different(file_args, changed)
+        # Get repo status after change
+        yumrepo_after = yumrepo.dump()
 
-    # Print status of the change
-    module.exit_json(changed=changed, repo=name, state=state)
+        # Compare repo states
+        changed = yumrepo_before != yumrepo_after
+
+        # Save the file only if not in check mode and if there was a change
+        if not module.check_mode and changed:
+            yumrepo.save()
+
+        # Change file attributes if needed
+        if os.path.isfile(module.params['dest']):
+            file_args = module.load_file_common_arguments(module.params)
+            changed = module.set_fs_attributes_if_different(file_args, changed)
+
+        # Print status of the change
+        module.exit_json(changed=changed, repo=name, state=state)
+    elif state in ['mm_enabled', 'mm_disabled', 'managed']:
+        # Perform action depending on the state
+        if state == 'mm_enabled':
+            changed = mm.enable()
+        elif state == 'mm_disabled':
+            changed = mm.disable()
+        elif state == 'managed':
+            changed = mm.process()
+
+        # Print status of the change
+        module.exit_json(changed=changed, state=state)
 
 
 # Import module snippets
